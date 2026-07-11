@@ -1,0 +1,25 @@
+# If true, only report unhealthy accounts and never delete.
+dry_run: false
+
+# Seconds between automatic scans. Minimum 30.
+interval_seconds: 300
+
+# Probe concurrency (1-10).
+concurrency: 3
+
+# Model used for health probe.
+model: "grok-4.5"
+
+# Required for free cli-chat-proxy accounts.
+cli_version: "0.1.220"
+
+# CPA management endpoint used to delete auth files.
+management_base: "http://127.0.0.1:8317"
+
+# REQUIRED for auto-delete. Do not commit real secrets.
+management_key: "CHANGE_ME"
+
+probe_enabled: true
+auto_delete: true
+delete_status_codes: [402, 403, 429]
+providers: ["xai"]

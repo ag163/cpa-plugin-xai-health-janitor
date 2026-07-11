@@ -1,0 +1,10 @@
+# Binaries
+*.so
+*.dll
+*.dylib
+*.h
+dist/
+
+# Local
+.DS_Store
+*.log
