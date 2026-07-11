@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "xai-health-janitor"
-	pluginVersion       = "0.1.1"
+	pluginVersion       = "0.1.4"
 	resourcePath        = "/status"
 	resourceContentType = "text/html; charset=utf-8"
 	defaultModel        = "grok-4.5"
@@ -321,7 +321,7 @@ func defaultConfig() pluginConfig {
 		ProbeEnabled:       &probe,
 		AutoDelete:         &autoDelete,
 		DryRun:             false,
-		DeleteStatus:       []int{402, 403, 429},
+		DeleteStatus:       []int{401, 402, 403, 429},
 		Providers:          []string{"xai"},
 		Concurrency:        1,
 		ProbeDelayMS:       800,
@@ -372,7 +372,7 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	}
 	cfg.ManagementKey = strings.TrimSpace(cfg.ManagementKey)
 	if len(cfg.DeleteStatus) == 0 {
-		cfg.DeleteStatus = []int{402, 403, 429}
+		cfg.DeleteStatus = []int{401, 402, 403, 429}
 	}
 	if len(cfg.Providers) == 0 {
 		cfg.Providers = []string{"xai"}
@@ -704,42 +704,45 @@ func isTargetProvider(f pluginapi.HostAuthFileEntry, providers []string) bool {
 }
 
 // summarizeUserTraffic estimates recent real user traffic from CPA auth stats.
-// It prefers recent_requests buckets and falls back to updated_at when success/failed changed.
+// Only the newest recent_requests buckets are considered; older non-zero history
+// must not keep the scanner permanently "busy".
 func summarizeUserTraffic(files []pluginapi.HostAuthFileEntry, providers []string, idleMinutes int) (int64, int64) {
 	var traffic int64
 	var lastActive int64
-	window := time.Duration(idleMinutes) * time.Minute
-	if window <= 0 {
-		window = 30 * time.Minute
+	if idleMinutes <= 0 {
+		idleMinutes = 30
 	}
-	now := time.Now()
+	// CPA buckets are typically ~10 minutes. Keep enough newest buckets to cover idle window.
+	keepBuckets := idleMinutes/10 + 1
+	if keepBuckets < 2 {
+		keepBuckets = 2
+	}
+	if keepBuckets > 12 {
+		keepBuckets = 12
+	}
+	now := time.Now().Unix()
 
 	for _, f := range files {
 		if !isTargetProvider(f, providers) {
 			continue
 		}
-		// recent_requests is a rolling set of short buckets with success/failed counts.
-		for _, rr := range f.RecentRequests {
+		rrs := f.RecentRequests
+		if len(rrs) == 0 {
+			continue
+		}
+		start := 0
+		if len(rrs) > keepBuckets {
+			start = len(rrs) - keepBuckets
+		}
+		for _, rr := range rrs[start:] {
 			n := rr.Success + rr.Failed
 			if n <= 0 {
 				continue
 			}
 			traffic += n
-			// Treat any non-zero recent bucket as activity within the idle window.
-			// CPA bucket labels are coarse (e.g. 11:10-11:20), so use "now" as active marker.
-			if ts := now.Unix(); ts > lastActive {
-				lastActive = ts
-			}
-		}
-		// Fallback: if account was updated recently and has historical success, count as active.
-		if !f.UpdatedAt.IsZero() && now.Sub(f.UpdatedAt) <= window {
-			if f.Success > 0 || f.Failed > 0 {
-				if f.UpdatedAt.Unix() > lastActive {
-					lastActive = f.UpdatedAt.Unix()
-				}
-				if traffic == 0 {
-					traffic = 1
-				}
+			// Newest non-empty buckets imply activity within the idle window.
+			if now > lastActive {
+				lastActive = now
 			}
 		}
 	}
@@ -821,8 +824,9 @@ func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult
 		"x-grok-client-version": {cliVersion},
 		"User-Agent":            {"xai-health-janitor/" + pluginVersion},
 	}
-	// Light probe first: GET /v1/user is enough to catch many 401/403 without burning chat quota.
-	// Fall back to a tiny chat completion only when needed / configured.
+	// Light probe: GET /v1/user catches many auth failures cheaply.
+	// NOTE: /user 200 does NOT prove chat works (chat may still 403). Always do a
+	// tiny chat probe after /user success so dead free accounts still get deleted.
 	if boolVal(cfg.LightProbe, true) {
 		probeURL = baseURL + "/user"
 		respUser, errUser := callHostHTTP("GET", probeURL, headers, nil)
@@ -833,18 +837,14 @@ func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult
 		}
 		result.ProbeHTTP = respUser.StatusCode
 		result.ProbeBody = trimBody(respUser.Body, 300)
-		if respUser.StatusCode >= 200 && respUser.StatusCode < 300 {
-			result.Action = "keep"
-			result.Reason = "healthy"
-			result.Category = "healthy"
-			return result
+		if respUser.StatusCode < 200 || respUser.StatusCode >= 300 {
+			reason := classifyStatus(respUser.StatusCode, string(respUser.Body), cfg.DeleteStatus)
+			if reason != "" {
+				result.Reason = reason
+				return maybeDelete(cfg, result)
+			}
+			// Non-fatal on /user: continue to chat probe.
 		}
-		reason := classifyStatus(respUser.StatusCode, string(respUser.Body), cfg.DeleteStatus)
-		if reason != "" {
-			result.Reason = reason
-			return maybeDelete(cfg, result)
-		}
-		// Non-fatal on /user: still try a minimal chat probe once.
 	}
 
 	probeURL = baseURL + "/chat/completions"
@@ -944,7 +944,7 @@ func classifyStatus(code int, body string, deleteCodes []int) string {
 	}
 	if textReason := classifyText(body); textReason != "" {
 		// Text-based hard failures even if status is unexpected.
-		if code == 402 || code == 403 || code == 429 {
+		if code == 401 || code == 402 || code == 403 || code == 429 {
 			return fmt.Sprintf("http_%d:%s", code, textReason)
 		}
 	}
@@ -1473,7 +1473,7 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<div class="field"><label>闲置多久暂停（分钟）</label><input type="number" name="idle_timeout_minutes" min="5" step="5" value="` + fmt.Sprintf("%d", cfg.IdleTimeoutMinutes) + `"></div>`)
 	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
 	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">默认轻量探测 + 闲置暂停：CPA 无 xAI 用户流量超过阈值后，定时扫描自动停；有流量或手动扫描会恢复。自动删除：402/403/429。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
+	out.WriteString(`<p class="muted" style="margin:12px 0 0">闲置暂停：无用户流量超时后定时扫描自动停。探测：先 /user 再极小 chat，避免漏删 chat 403。自动删除：401/402/403/429。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
 	out.WriteString(`</section>`)
 
 	// last scan panel
