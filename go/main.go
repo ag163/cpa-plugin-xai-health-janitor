@@ -75,14 +75,15 @@ import (
 
 const (
 	pluginName          = "xai-health-janitor"
-	pluginVersion       = "0.1.0"
+	pluginVersion       = "0.1.1"
 	resourcePath        = "/status"
 	resourceContentType = "text/html; charset=utf-8"
 	defaultModel        = "grok-4.5"
 	defaultCLIVersion   = "0.1.220"
-	defaultIntervalSec  = 300
+	defaultIntervalSec  = 600
 	defaultBaseURL      = "https://cli-chat-proxy.grok.com/v1"
 	defaultMgmtBase     = "http://127.0.0.1:8317"
+	minScanGapSec       = 120
 )
 
 type envelope struct {
@@ -145,6 +146,9 @@ type pluginConfig struct {
 	DeleteStatus    []int    `yaml:"delete_status_codes" json:"delete_status_codes"`
 	Providers       []string `yaml:"providers" json:"providers"`
 	Concurrency     int      `yaml:"concurrency" json:"concurrency"`
+	ProbeDelayMS    int      `yaml:"probe_delay_ms" json:"probe_delay_ms"`
+	LightProbe      *bool    `yaml:"light_probe" json:"light_probe"`
+	ScanOnStartup   *bool    `yaml:"scan_on_startup" json:"scan_on_startup"`
 }
 
 type authListResponse struct {
@@ -211,8 +215,10 @@ var (
 	workerMu      sync.Mutex
 	stopCh        chan struct{}
 	running       atomic.Bool
+	workerStarted atomic.Bool
 	lastSummary   atomic.Value
 	scanInFlight  atomic.Bool
+	lastScanUnix  atomic.Int64
 )
 
 func main() {}
@@ -296,6 +302,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 func defaultConfig() pluginConfig {
 	probe := true
 	autoDelete := true
+	light := true
+	startup := false
 	return pluginConfig{
 		IntervalSeconds: defaultIntervalSec,
 		Model:           defaultModel,
@@ -306,7 +314,10 @@ func defaultConfig() pluginConfig {
 		DryRun:          false,
 		DeleteStatus:    []int{402, 403, 429},
 		Providers:       []string{"xai"},
-		Concurrency:     3,
+		Concurrency:     1,
+		ProbeDelayMS:    800,
+		LightProbe:      &light,
+		ScanOnStartup:   &startup,
 	}
 }
 
@@ -359,10 +370,17 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 		cfg.Providers[i] = strings.ToLower(strings.TrimSpace(cfg.Providers[i]))
 	}
 	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.Concurrency > 3 {
+		// Cap hard: full-pool chat probes easily starve live sessions.
 		cfg.Concurrency = 3
 	}
-	if cfg.Concurrency > 10 {
-		cfg.Concurrency = 10
+	if cfg.ProbeDelayMS < 0 {
+		cfg.ProbeDelayMS = 0
+	}
+	if cfg.ProbeDelayMS == 0 {
+		cfg.ProbeDelayMS = 800
 	}
 	if cfg.ProbeEnabled == nil {
 		v := true
@@ -371,6 +389,14 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	if cfg.AutoDelete == nil {
 		v := true
 		cfg.AutoDelete = &v
+	}
+	if cfg.LightProbe == nil {
+		v := true
+		cfg.LightProbe = &v
+	}
+	if cfg.ScanOnStartup == nil {
+		v := false
+		cfg.ScanOnStartup = &v
 	}
 	return cfg
 }
@@ -401,7 +427,10 @@ func pluginRegistration() registration {
 				{Name: "probe_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Actually call upstream chat endpoint for each xAI auth."},
 				{Name: "auto_delete", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Delete unhealthy auths automatically."},
 				{Name: "dry_run", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Only report unhealthy auths, never delete."},
-				{Name: "concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Probe concurrency (1-10)."},
+				{Name: "concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Probe concurrency (1-3, default 1)."},
+				{Name: "probe_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay between probes in ms (default 800)."},
+				{Name: "light_probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Use lightweight probe payload to reduce rate-limit impact."},
+				{Name: "scan_on_startup", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Run one scan shortly after plugin start (default false)."},
 			},
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
@@ -411,6 +440,11 @@ func pluginRegistration() registration {
 func ensureWorker() {
 	workerMu.Lock()
 	defer workerMu.Unlock()
+	// Auth-file changes reconfigure the plugin frequently. Never restart the
+	// timer worker or auto-scan on every reconfigure, or live sessions get starved.
+	if workerStarted.Load() && stopCh != nil {
+		return
+	}
 	if stopCh != nil {
 		select {
 		case <-stopCh:
@@ -420,17 +454,20 @@ func ensureWorker() {
 	}
 	stopCh = make(chan struct{})
 	running.Store(true)
+	workerStarted.Store(true)
 	ch := stopCh
 	go workerLoop(ch)
-	go func() {
-		time.Sleep(3 * time.Second)
-		select {
-		case <-ch:
-			return
-		default:
-			runScan("startup")
-		}
-	}()
+	if boolVal(loadedConfig().ScanOnStartup, false) {
+		go func() {
+			time.Sleep(15 * time.Second)
+			select {
+			case <-ch:
+				return
+			default:
+				runScan("startup")
+			}
+		}()
+	}
 }
 
 func stopWorker() {
@@ -445,10 +482,12 @@ func stopWorker() {
 		stopCh = nil
 	}
 	running.Store(false)
+	workerStarted.Store(false)
 }
 
 func workerLoop(ch <-chan struct{}) {
 	cfg := loadedConfig()
+	// First automatic scan waits a full interval; avoid colliding with user traffic on boot.
 	ticker := time.NewTicker(time.Duration(cfg.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
 	for {
@@ -472,6 +511,16 @@ func runScan(triggeredBy string) *runSummary {
 		return nil
 	}
 	defer scanInFlight.Store(false)
+
+	// Debounce: auth uploads/deletes used to re-trigger dense full-pool probes.
+	if triggeredBy != "manual" {
+		last := lastScanUnix.Load()
+		now := time.Now().Unix()
+		if last > 0 && now-last < minScanGapSec {
+			hostLog("info", fmt.Sprintf("%s: scan skipped (%s), last scan %ds ago (min gap %ds)", pluginName, triggeredBy, now-last, minScanGapSec))
+			return nil
+		}
+	}
 
 	cfg := loadedConfig()
 	started := time.Now()
@@ -575,6 +624,7 @@ func runScan(triggeredBy string) *runSummary {
 	summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	summary.DurationMS = time.Since(started).Milliseconds()
 	lastSummary.Store(summary)
+	lastScanUnix.Store(time.Now().Unix())
 	hostLog("info", fmt.Sprintf("%s: scan done total=%d healthy=%d unhealthy=%d deleted=%d errors=%d dry_run=%v",
 		pluginName, summary.Total, summary.Healthy, summary.Unhealthy, summary.Deleted, summary.Errors, summary.DryRun))
 	return summary
@@ -656,21 +706,55 @@ func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult
 		}
 	}
 
-	body, _ := json.Marshal(map[string]any{
+	// Stagger probes so live user sessions are less likely to get rate-limited.
+	if cfg.ProbeDelayMS > 0 {
+		time.Sleep(time.Duration(cfg.ProbeDelayMS) * time.Millisecond)
+	}
+
+	var body []byte
+	var probeURL string
+	headers := map[string][]string{
+		"Authorization":         {"Bearer " + token},
+		"Accept":                {"application/json"},
+		"x-grok-client-version": {cliVersion},
+		"User-Agent":            {"xai-health-janitor/" + pluginVersion},
+	}
+	// Light probe first: GET /v1/user is enough to catch many 401/403 without burning chat quota.
+	// Fall back to a tiny chat completion only when needed / configured.
+	if boolVal(cfg.LightProbe, true) {
+		probeURL = baseURL + "/user"
+		respUser, errUser := callHostHTTP("GET", probeURL, headers, nil)
+		if errUser != nil {
+			result.Error = "probe user: " + errUser.Error()
+			result.Action = "keep"
+			return result
+		}
+		result.ProbeHTTP = respUser.StatusCode
+		result.ProbeBody = trimBody(respUser.Body, 300)
+		if respUser.StatusCode >= 200 && respUser.StatusCode < 300 {
+			result.Action = "keep"
+			result.Reason = "healthy"
+			result.Category = "healthy"
+			return result
+		}
+		reason := classifyStatus(respUser.StatusCode, string(respUser.Body), cfg.DeleteStatus)
+		if reason != "" {
+			result.Reason = reason
+			return maybeDelete(cfg, result)
+		}
+		// Non-fatal on /user: still try a minimal chat probe once.
+	}
+
+	probeURL = baseURL + "/chat/completions"
+	headers["Content-Type"] = []string{"application/json"}
+	body, _ = json.Marshal(map[string]any{
 		"model": cfg.Model,
 		"messages": []map[string]string{
-			{"role": "user", "content": "ping"},
+			{"role": "user", "content": "ok"},
 		},
-		"max_tokens": 4,
+		"max_tokens": 1,
 	})
-	headers := map[string][]string{
-		"Authorization":          { "Bearer " + token },
-		"Content-Type":           {"application/json"},
-		"Accept":                 {"application/json"},
-		"x-grok-client-version":  {cliVersion},
-		"User-Agent":             {"xai-health-janitor/" + pluginVersion},
-	}
-	resp, errHTTP := callHostHTTP("POST", baseURL+"/chat/completions", headers, body)
+	resp, errHTTP := callHostHTTP("POST", probeURL, headers, body)
 	if errHTTP != nil {
 		// Network failures should not delete accounts.
 		result.Error = "probe: " + errHTTP.Error()
@@ -918,6 +1002,18 @@ func applySettings(req managementRequest) (string, error) {
 			cfg.Concurrency = n
 			changed = true
 		}
+		if n, ok := readInt(req.Query.Get("probe_delay_ms")); ok {
+			cfg.ProbeDelayMS = n
+			changed = true
+		}
+		if b, ok := readBool(req.Query.Get("light_probe")); ok {
+			cfg.LightProbe = &b
+			changed = true
+		}
+		if b, ok := readBool(req.Query.Get("scan_on_startup")); ok {
+			cfg.ScanOnStartup = &b
+			changed = true
+		}
 		if v := strings.TrimSpace(req.Query.Get("model")); v != "" {
 			cfg.Model = v
 			changed = true
@@ -958,6 +1054,18 @@ func applySettings(req managementRequest) (string, error) {
 			}
 			if n, ok := readInt(last("concurrency")); ok {
 				cfg.Concurrency = n
+				changed = true
+			}
+			if n, ok := readInt(last("probe_delay_ms")); ok {
+				cfg.ProbeDelayMS = n
+				changed = true
+			}
+			if b, ok := readBool(last("light_probe")); ok {
+				cfg.LightProbe = &b
+				changed = true
+			}
+			if b, ok := readBool(last("scan_on_startup")); ok {
+				cfg.ScanOnStartup = &b
 				changed = true
 			}
 			if v := strings.TrimSpace(last("model")); v != "" {
@@ -1001,6 +1109,20 @@ func applySettings(req managementRequest) (string, error) {
 						cfg.Concurrency = int(n)
 						changed = true
 					}
+				}
+				if v, ok := body["probe_delay_ms"]; ok {
+					if n, ok2 := v.(float64); ok2 {
+						cfg.ProbeDelayMS = int(n)
+						changed = true
+					}
+				}
+				if v, ok := body["light_probe"].(bool); ok {
+					cfg.LightProbe = &v
+					changed = true
+				}
+				if v, ok := body["scan_on_startup"].(bool); ok {
+					cfg.ScanOnStartup = &v
+					changed = true
 				}
 				if v, ok := body["model"].(string); ok && strings.TrimSpace(v) != "" {
 					cfg.Model = strings.TrimSpace(v)
@@ -1057,6 +1179,9 @@ func persistPluginConfig(cfg pluginConfig) string {
 		"auto_delete":         boolVal(cfg.AutoDelete, true),
 		"dry_run":             cfg.DryRun,
 		"concurrency":         cfg.Concurrency,
+		"probe_delay_ms":      cfg.ProbeDelayMS,
+		"light_probe":         boolVal(cfg.LightProbe, true),
+		"scan_on_startup":     boolVal(cfg.ScanOnStartup, false),
 		"delete_status_codes": cfg.DeleteStatus,
 		"providers":           cfg.Providers,
 	})
@@ -1109,6 +1234,9 @@ func sanitizeConfig(cfg pluginConfig) map[string]any {
 		"delete_status_codes": cfg.DeleteStatus,
 		"providers":           cfg.Providers,
 		"concurrency":         cfg.Concurrency,
+		"probe_delay_ms":      cfg.ProbeDelayMS,
+		"light_probe":         boolVal(cfg.LightProbe, true),
+		"scan_on_startup":     boolVal(cfg.ScanOnStartup, false),
 	}
 }
 
@@ -1198,16 +1326,19 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<section class="panel"><h2>扫描设置</h2>`)
 	out.WriteString(`<form class="form" method="post" action="?op=save_settings">`)
 	out.WriteString(`<div class="field"><label>轮询间隔（秒）</label><input type="number" name="interval_seconds" min="30" step="30" value="` + fmt.Sprintf("%d", cfg.IntervalSeconds) + `"></div>`)
-	out.WriteString(`<div class="field"><label>并发数</label><input type="number" name="concurrency" min="1" max="10" value="` + fmt.Sprintf("%d", cfg.Concurrency) + `"></div>`)
+	out.WriteString(`<div class="field"><label>并发数（建议 1）</label><input type="number" name="concurrency" min="1" max="3" value="` + fmt.Sprintf("%d", cfg.Concurrency) + `"></div>`)
+	out.WriteString(`<div class="field"><label>探测间隔 ms</label><input type="number" name="probe_delay_ms" min="0" step="100" value="` + fmt.Sprintf("%d", cfg.ProbeDelayMS) + `"></div>`)
 	out.WriteString(`<div class="field"><label>探测模型</label><input type="text" name="model" value="` + html.EscapeString(cfg.Model) + `"></div>`)
 	out.WriteString(`<div class="field"><label>CLI Version 头</label><input type="text" name="cli_version" value="` + html.EscapeString(cfg.CLIVersion) + `"></div>`)
 	out.WriteString(`<div class="checks">`)
 	out.WriteString(checkBox("probe_enabled", "启用探测", boolVal(cfg.ProbeEnabled, true)))
+	out.WriteString(checkBox("light_probe", "轻量探测(/user优先)", boolVal(cfg.LightProbe, true)))
 	out.WriteString(checkBox("auto_delete", "自动删除异常号", boolVal(cfg.AutoDelete, true)))
 	out.WriteString(checkBox("dry_run", "仅演练(不删除)", cfg.DryRun))
+	out.WriteString(checkBox("scan_on_startup", "启动时自动扫描", boolVal(cfg.ScanOnStartup, false)))
 	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
 	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">自动删除范围：HTTP 402 / 403 / 429，以及 permission-denied / spending-limit / rate-limit / auth invalid。当前已删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
+	out.WriteString(`<p class="muted" style="margin:12px 0 0">默认轻量探测，避免抢占新会话额度。自动删除：402/403/429 与 permission-denied / spending-limit / rate-limit。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
 	out.WriteString(`</section>`)
 
 	// last scan panel
