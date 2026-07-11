@@ -146,9 +146,11 @@ type pluginConfig struct {
 	DeleteStatus    []int    `yaml:"delete_status_codes" json:"delete_status_codes"`
 	Providers       []string `yaml:"providers" json:"providers"`
 	Concurrency     int      `yaml:"concurrency" json:"concurrency"`
-	ProbeDelayMS    int      `yaml:"probe_delay_ms" json:"probe_delay_ms"`
-	LightProbe      *bool    `yaml:"light_probe" json:"light_probe"`
-	ScanOnStartup   *bool    `yaml:"scan_on_startup" json:"scan_on_startup"`
+	ProbeDelayMS       int      `yaml:"probe_delay_ms" json:"probe_delay_ms"`
+	LightProbe         *bool    `yaml:"light_probe" json:"light_probe"`
+	ScanOnStartup      *bool    `yaml:"scan_on_startup" json:"scan_on_startup"`
+	IdlePauseEnabled   *bool    `yaml:"idle_pause_enabled" json:"idle_pause_enabled"`
+	IdleTimeoutMinutes int      `yaml:"idle_timeout_minutes" json:"idle_timeout_minutes"`
 }
 
 type authListResponse struct {
@@ -202,6 +204,10 @@ type runSummary struct {
 	Results        []probeResult `json:"results"`
 	LastError      string        `json:"last_error,omitempty"`
 	TriggeredBy    string        `json:"triggered_by"`
+	IdlePaused     bool          `json:"idle_paused,omitempty"`
+	IdleReason     string        `json:"idle_reason,omitempty"`
+	LastUserActive string        `json:"last_user_active,omitempty"`
+	UserTraffic    int64         `json:"user_traffic,omitempty"`
 }
 
 type hostHTTPResponse struct {
@@ -217,8 +223,10 @@ var (
 	running       atomic.Bool
 	workerStarted atomic.Bool
 	lastSummary   atomic.Value
-	scanInFlight  atomic.Bool
-	lastScanUnix  atomic.Int64
+	scanInFlight       atomic.Bool
+	lastScanUnix       atomic.Int64
+	lastUserActiveUnix atomic.Int64
+	idlePaused         atomic.Bool
 )
 
 func main() {}
@@ -304,20 +312,23 @@ func defaultConfig() pluginConfig {
 	autoDelete := true
 	light := true
 	startup := false
+	idlePause := true
 	return pluginConfig{
-		IntervalSeconds: defaultIntervalSec,
-		Model:           defaultModel,
-		CLIVersion:      defaultCLIVersion,
-		ManagementBase:  defaultMgmtBase,
-		ProbeEnabled:    &probe,
-		AutoDelete:      &autoDelete,
-		DryRun:          false,
-		DeleteStatus:    []int{402, 403, 429},
-		Providers:       []string{"xai"},
-		Concurrency:     1,
-		ProbeDelayMS:    800,
-		LightProbe:      &light,
-		ScanOnStartup:   &startup,
+		IntervalSeconds:    defaultIntervalSec,
+		Model:              defaultModel,
+		CLIVersion:         defaultCLIVersion,
+		ManagementBase:     defaultMgmtBase,
+		ProbeEnabled:       &probe,
+		AutoDelete:         &autoDelete,
+		DryRun:             false,
+		DeleteStatus:       []int{402, 403, 429},
+		Providers:          []string{"xai"},
+		Concurrency:        1,
+		ProbeDelayMS:       800,
+		LightProbe:         &light,
+		ScanOnStartup:      &startup,
+		IdlePauseEnabled:   &idlePause,
+		IdleTimeoutMinutes: 30,
 	}
 }
 
@@ -398,6 +409,16 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 		v := false
 		cfg.ScanOnStartup = &v
 	}
+	if cfg.IdlePauseEnabled == nil {
+		v := true
+		cfg.IdlePauseEnabled = &v
+	}
+	if cfg.IdleTimeoutMinutes <= 0 {
+		cfg.IdleTimeoutMinutes = 30
+	}
+	if cfg.IdleTimeoutMinutes < 5 {
+		cfg.IdleTimeoutMinutes = 5
+	}
 	return cfg
 }
 
@@ -431,6 +452,8 @@ func pluginRegistration() registration {
 				{Name: "probe_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay between probes in ms (default 800)."},
 				{Name: "light_probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Use lightweight probe payload to reduce rate-limit impact."},
 				{Name: "scan_on_startup", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Run one scan shortly after plugin start (default false)."},
+				{Name: "idle_pause_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Skip timer scans when CPA has no recent xAI user traffic."},
+				{Name: "idle_timeout_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Minutes without user traffic before auto-pause (default 30)."},
 			},
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
@@ -530,7 +553,6 @@ func runScan(triggeredBy string) *runSummary {
 		TriggeredBy: triggeredBy,
 		Results:     make([]probeResult, 0),
 	}
-	hostLog("info", fmt.Sprintf("%s: scan start (%s)", pluginName, triggeredBy))
 
 	files, errList := callHostAuthList()
 	if errList != nil {
@@ -542,6 +564,43 @@ func runScan(triggeredBy string) *runSummary {
 		hostLog("error", pluginName+": list auth failed: "+errList.Error())
 		return summary
 	}
+
+	traffic, lastActive := summarizeUserTraffic(files, cfg.Providers, cfg.IdleTimeoutMinutes)
+	summary.UserTraffic = traffic
+	if lastActive > 0 {
+		lastUserActiveUnix.Store(lastActive)
+		summary.LastUserActive = time.Unix(lastActive, 0).UTC().Format(time.RFC3339)
+	} else if v := lastUserActiveUnix.Load(); v > 0 {
+		summary.LastUserActive = time.Unix(v, 0).UTC().Format(time.RFC3339)
+	}
+
+	// Idle auto-pause: timer scans only. Manual always runs.
+	if triggeredBy == "timer" && boolVal(cfg.IdlePauseEnabled, true) {
+		idleFor := int64(cfg.IdleTimeoutMinutes) * 60
+		now := time.Now().Unix()
+		activeAt := lastUserActiveUnix.Load()
+		if traffic == 0 && (activeAt == 0 || now-activeAt >= idleFor) {
+			idlePaused.Store(true)
+			summary.IdlePaused = true
+			summary.IdleReason = fmt.Sprintf("idle >= %dm, no CPA xAI user traffic", cfg.IdleTimeoutMinutes)
+			summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+			summary.DurationMS = time.Since(started).Milliseconds()
+			// Count current pool size for dashboard without probing.
+			for _, f := range files {
+				if f.Disabled || f.RuntimeOnly {
+					continue
+				}
+				if isTargetProvider(f, cfg.Providers) {
+					summary.Total++
+				}
+			}
+			lastSummary.Store(summary)
+			hostLog("info", fmt.Sprintf("%s: timer scan paused (%s)", pluginName, summary.IdleReason))
+			return summary
+		}
+	}
+	idlePaused.Store(false)
+	hostLog("info", fmt.Sprintf("%s: scan start (%s) user_traffic=%d", pluginName, triggeredBy, traffic))
 
 	targets := make([]pluginapi.HostAuthFileEntry, 0)
 	for _, f := range files {
@@ -642,6 +701,49 @@ func isTargetProvider(f pluginapi.HostAuthFileEntry, providers []string) bool {
 		}
 	}
 	return false
+}
+
+// summarizeUserTraffic estimates recent real user traffic from CPA auth stats.
+// It prefers recent_requests buckets and falls back to updated_at when success/failed changed.
+func summarizeUserTraffic(files []pluginapi.HostAuthFileEntry, providers []string, idleMinutes int) (int64, int64) {
+	var traffic int64
+	var lastActive int64
+	window := time.Duration(idleMinutes) * time.Minute
+	if window <= 0 {
+		window = 30 * time.Minute
+	}
+	now := time.Now()
+
+	for _, f := range files {
+		if !isTargetProvider(f, providers) {
+			continue
+		}
+		// recent_requests is a rolling set of short buckets with success/failed counts.
+		for _, rr := range f.RecentRequests {
+			n := rr.Success + rr.Failed
+			if n <= 0 {
+				continue
+			}
+			traffic += n
+			// Treat any non-zero recent bucket as activity within the idle window.
+			// CPA bucket labels are coarse (e.g. 11:10-11:20), so use "now" as active marker.
+			if ts := now.Unix(); ts > lastActive {
+				lastActive = ts
+			}
+		}
+		// Fallback: if account was updated recently and has historical success, count as active.
+		if !f.UpdatedAt.IsZero() && now.Sub(f.UpdatedAt) <= window {
+			if f.Success > 0 || f.Failed > 0 {
+				if f.UpdatedAt.Unix() > lastActive {
+					lastActive = f.UpdatedAt.Unix()
+				}
+				if traffic == 0 {
+					traffic = 1
+				}
+			}
+		}
+	}
+	return traffic, lastActive
 }
 
 func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult {
@@ -1014,6 +1116,14 @@ func applySettings(req managementRequest) (string, error) {
 			cfg.ScanOnStartup = &b
 			changed = true
 		}
+		if b, ok := readBool(req.Query.Get("idle_pause_enabled")); ok {
+			cfg.IdlePauseEnabled = &b
+			changed = true
+		}
+		if n, ok := readInt(req.Query.Get("idle_timeout_minutes")); ok {
+			cfg.IdleTimeoutMinutes = n
+			changed = true
+		}
 		if v := strings.TrimSpace(req.Query.Get("model")); v != "" {
 			cfg.Model = v
 			changed = true
@@ -1066,6 +1176,14 @@ func applySettings(req managementRequest) (string, error) {
 			}
 			if b, ok := readBool(last("scan_on_startup")); ok {
 				cfg.ScanOnStartup = &b
+				changed = true
+			}
+			if b, ok := readBool(last("idle_pause_enabled")); ok {
+				cfg.IdlePauseEnabled = &b
+				changed = true
+			}
+			if n, ok := readInt(last("idle_timeout_minutes")); ok {
+				cfg.IdleTimeoutMinutes = n
 				changed = true
 			}
 			if v := strings.TrimSpace(last("model")); v != "" {
@@ -1124,6 +1242,16 @@ func applySettings(req managementRequest) (string, error) {
 					cfg.ScanOnStartup = &v
 					changed = true
 				}
+				if v, ok := body["idle_pause_enabled"].(bool); ok {
+					cfg.IdlePauseEnabled = &v
+					changed = true
+				}
+				if v, ok := body["idle_timeout_minutes"]; ok {
+					if n, ok2 := v.(float64); ok2 {
+						cfg.IdleTimeoutMinutes = int(n)
+						changed = true
+					}
+				}
 				if v, ok := body["model"].(string); ok && strings.TrimSpace(v) != "" {
 					cfg.Model = strings.TrimSpace(v)
 					changed = true
@@ -1180,10 +1308,12 @@ func persistPluginConfig(cfg pluginConfig) string {
 		"dry_run":             cfg.DryRun,
 		"concurrency":         cfg.Concurrency,
 		"probe_delay_ms":      cfg.ProbeDelayMS,
-		"light_probe":         boolVal(cfg.LightProbe, true),
-		"scan_on_startup":     boolVal(cfg.ScanOnStartup, false),
-		"delete_status_codes": cfg.DeleteStatus,
-		"providers":           cfg.Providers,
+		"light_probe":          boolVal(cfg.LightProbe, true),
+		"scan_on_startup":      boolVal(cfg.ScanOnStartup, false),
+		"idle_pause_enabled":   boolVal(cfg.IdlePauseEnabled, true),
+		"idle_timeout_minutes": cfg.IdleTimeoutMinutes,
+		"delete_status_codes":  cfg.DeleteStatus,
+		"providers":            cfg.Providers,
 	})
 	endpoint := strings.TrimRight(cfg.ManagementBase, "/") + "/v0/management/plugins/" + pluginName + "/config"
 	headers := map[string][]string{
@@ -1233,10 +1363,13 @@ func sanitizeConfig(cfg pluginConfig) map[string]any {
 		"dry_run":             cfg.DryRun,
 		"delete_status_codes": cfg.DeleteStatus,
 		"providers":           cfg.Providers,
-		"concurrency":         cfg.Concurrency,
-		"probe_delay_ms":      cfg.ProbeDelayMS,
-		"light_probe":         boolVal(cfg.LightProbe, true),
-		"scan_on_startup":     boolVal(cfg.ScanOnStartup, false),
+		"concurrency":          cfg.Concurrency,
+		"probe_delay_ms":       cfg.ProbeDelayMS,
+		"light_probe":          boolVal(cfg.LightProbe, true),
+		"scan_on_startup":      boolVal(cfg.ScanOnStartup, false),
+		"idle_pause_enabled":   boolVal(cfg.IdlePauseEnabled, true),
+		"idle_timeout_minutes": cfg.IdleTimeoutMinutes,
+		"idle_paused_now":      idlePaused.Load(),
 	}
 }
 
@@ -1336,9 +1469,11 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(checkBox("auto_delete", "自动删除异常号", boolVal(cfg.AutoDelete, true)))
 	out.WriteString(checkBox("dry_run", "仅演练(不删除)", cfg.DryRun))
 	out.WriteString(checkBox("scan_on_startup", "启动时自动扫描", boolVal(cfg.ScanOnStartup, false)))
+	out.WriteString(checkBox("idle_pause_enabled", "闲置自动暂停", boolVal(cfg.IdlePauseEnabled, true)))
+	out.WriteString(`<div class="field"><label>闲置多久暂停（分钟）</label><input type="number" name="idle_timeout_minutes" min="5" step="5" value="` + fmt.Sprintf("%d", cfg.IdleTimeoutMinutes) + `"></div>`)
 	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
 	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">默认轻量探测，避免抢占新会话额度。自动删除：402/403/429 与 permission-denied / spending-limit / rate-limit。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
+	out.WriteString(`<p class="muted" style="margin:12px 0 0">默认轻量探测 + 闲置暂停：CPA 无 xAI 用户流量超过阈值后，定时扫描自动停；有流量或手动扫描会恢复。自动删除：402/403/429。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
 	out.WriteString(`</section>`)
 
 	// last scan panel
@@ -1347,6 +1482,17 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<span class="pill">完成：` + html.EscapeString(finished) + `</span>`)
 	out.WriteString(`<span class="pill">耗时：` + fmt.Sprintf("%dms", duration) + `</span>`)
 	out.WriteString(`<span class="pill">探测错误：` + fmt.Sprintf("%d", cErr) + `</span>`)
+	if idlePaused.Load() {
+		out.WriteString(`<span class="pill" style="background:#fff7ed;color:#c2410c">状态：闲置已暂停</span>`)
+	} else {
+		out.WriteString(`<span class="pill" style="background:#ecfdf5;color:#047857">状态：监控中</span>`)
+	}
+	if summary != nil && summary.LastUserActive != "" {
+		out.WriteString(`<span class="pill">最近用户活动：` + html.EscapeString(summary.LastUserActive) + `</span>`)
+	}
+	if summary != nil && summary.IdlePaused && summary.IdleReason != "" {
+		out.WriteString(`<span class="pill">` + html.EscapeString(summary.IdleReason) + `</span>`)
+	}
 	out.WriteString(`</div>`)
 
 	if summary == nil {
