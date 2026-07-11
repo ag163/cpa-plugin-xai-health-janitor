@@ -297,7 +297,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Resources: []managementResource{{
 				Path:        resourcePath,
 				Menu:        "XAI Health Janitor",
-				Description: "Periodically probes xAI/Grok auths and deletes 402/403/429 or rate-limited accounts.",
+				Description: "Periodically probes xAI/Grok auths and deletes 401/402/403 hard failures. Rate-limited accounts are kept.",
 			}},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -321,7 +321,7 @@ func defaultConfig() pluginConfig {
 		ProbeEnabled:       &probe,
 		AutoDelete:         &autoDelete,
 		DryRun:             false,
-		DeleteStatus:       []int{401, 402, 403, 429},
+		DeleteStatus:       []int{401, 402, 403},
 		Providers:          []string{"xai"},
 		Concurrency:        1,
 		ProbeDelayMS:       800,
@@ -372,7 +372,7 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	}
 	cfg.ManagementKey = strings.TrimSpace(cfg.ManagementKey)
 	if len(cfg.DeleteStatus) == 0 {
-		cfg.DeleteStatus = []int{401, 402, 403, 429}
+		cfg.DeleteStatus = []int{401, 402, 403}
 	}
 	if len(cfg.Providers) == 0 {
 		cfg.Providers = []string{"xai"}
@@ -886,9 +886,33 @@ func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult
 	return maybeDelete(cfg, result)
 }
 
+func isRateLimitOnly(result probeResult) bool {
+	if result.ProbeHTTP == 429 {
+		return true
+	}
+	blob := strings.ToLower(result.Reason + " " + result.ProbeBody + " " + result.StatusMessage)
+	return strings.Contains(blob, "rate_limited") ||
+		strings.Contains(blob, "rate limit") ||
+		strings.Contains(blob, "rate_limit") ||
+		strings.Contains(blob, "too many requests") ||
+		strings.Contains(blob, "resource_exhausted") ||
+		strings.Contains(blob, "free-usage-exhausted") ||
+		strings.Contains(blob, "usage-exhausted") ||
+		strings.Contains(blob, "http_429")
+}
+
 func maybeDelete(cfg pluginConfig, result probeResult) probeResult {
 	if result.Reason == "" {
 		result.Action = "keep"
+		return result
+	}
+	// Temporary quota / rate-limit: keep account for later reuse.
+	if isRateLimitOnly(result) {
+		result.Action = "keep"
+		result.Category = "rate_limit"
+		if result.Reason == "" {
+			result.Reason = "rate_limited"
+		}
 		return result
 	}
 	if !boolVal(cfg.AutoDelete, true) || cfg.DryRun {
@@ -958,7 +982,7 @@ func classifyText(text string) string {
 		return "permission_denied"
 	case strings.Contains(lower, "spending-limit"), strings.Contains(lower, "run out of credits"), strings.Contains(lower, "personal-team-blocked"):
 		return "spending_limit"
-	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "rate_limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "resource_exhausted"):
+	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "rate_limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "resource_exhausted"), strings.Contains(lower, "free-usage-exhausted"), strings.Contains(lower, "usage-exhausted"), strings.Contains(lower, "usage resets over a rolling"):
 		return "rate_limited"
 	case strings.Contains(lower, "upgrade required"), strings.Contains(lower, "cli version"):
 		// Version issue is config problem, not account death; keep account.
@@ -1473,7 +1497,7 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<div class="field"><label>闲置多久暂停（分钟）</label><input type="number" name="idle_timeout_minutes" min="5" step="5" value="` + fmt.Sprintf("%d", cfg.IdleTimeoutMinutes) + `"></div>`)
 	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
 	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">闲置暂停：无用户流量超时后定时扫描自动停。探测：先 /user 再极小 chat，避免漏删 chat 403。自动删除：401/402/403/429。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
+	out.WriteString(`<p class="muted" style="margin:12px 0 0">闲置暂停：无用户流量超时后定时扫描自动停。探测：先 /user 再极小 chat。自动删除：401/402/403（硬失败）。限流/额度耗尽(429)只标记不删除。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
 	out.WriteString(`</section>`)
 
 	// last scan panel
