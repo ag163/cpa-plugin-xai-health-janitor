@@ -1,17 +1,8 @@
-# If true, only report unhealthy accounts and never delete.
+# Only act on hard failures that CLIProxyAPI recorded from real user traffic.
 dry_run: false
 
-# Seconds between automatic scans. Minimum 30.
-interval_seconds: 300
-
-# Probe concurrency (1-10).
-concurrency: 3
-
-# Model used for health probe.
-model: "grok-4.5"
-
-# Required for free cli-chat-proxy accounts.
-cli_version: "0.1.220"
+# Seconds between passive local status checks. Minimum 30.
+interval_seconds: 600
 
 # CPA management endpoint used to delete auth files.
 management_base: "http://127.0.0.1:8317"
@@ -19,7 +10,14 @@ management_base: "http://127.0.0.1:8317"
 # REQUIRED for auto-delete. Do not commit real secrets.
 management_key: "CHANGE_ME"
 
-probe_enabled: true
+# Legacy setting. Active upstream probing is always disabled.
+probe_enabled: false
 auto_delete: true
-delete_status_codes: [402, 403, 429]
+delete_status_codes: [401, 402, 403]
 providers: ["xai"]
+
+# Do nothing until CLIProxyAPI has observed real recent xAI user traffic.
+require_user_traffic: true
+
+# Matching hard failures observed in status/status_message before deletion.
+hard_failure_confirmations: 2

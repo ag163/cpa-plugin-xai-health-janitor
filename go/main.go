@@ -75,13 +75,12 @@ import (
 
 const (
 	pluginName          = "xai-health-janitor"
-	pluginVersion       = "0.1.4"
+	pluginVersion       = "0.2.0"
 	resourcePath        = "/status"
 	resourceContentType = "text/html; charset=utf-8"
 	defaultModel        = "grok-4.5"
 	defaultCLIVersion   = "0.1.220"
 	defaultIntervalSec  = 600
-	defaultBaseURL      = "https://cli-chat-proxy.grok.com/v1"
 	defaultMgmtBase     = "http://127.0.0.1:8317"
 	minScanGapSec       = 120
 )
@@ -135,36 +134,28 @@ type managementResponse struct {
 }
 
 type pluginConfig struct {
-	IntervalSeconds int      `yaml:"interval_seconds" json:"interval_seconds"`
-	Model           string   `yaml:"model" json:"model"`
-	CLIVersion      string   `yaml:"cli_version" json:"cli_version"`
-	ManagementBase  string   `yaml:"management_base" json:"management_base"`
-	ManagementKey   string   `yaml:"management_key" json:"management_key"`
-	ProbeEnabled    *bool    `yaml:"probe_enabled" json:"probe_enabled"`
-	AutoDelete      *bool    `yaml:"auto_delete" json:"auto_delete"`
-	DryRun          bool     `yaml:"dry_run" json:"dry_run"`
-	DeleteStatus    []int    `yaml:"delete_status_codes" json:"delete_status_codes"`
-	Providers       []string `yaml:"providers" json:"providers"`
-	Concurrency     int      `yaml:"concurrency" json:"concurrency"`
-	ProbeDelayMS       int      `yaml:"probe_delay_ms" json:"probe_delay_ms"`
-	LightProbe         *bool    `yaml:"light_probe" json:"light_probe"`
-	ScanOnStartup      *bool    `yaml:"scan_on_startup" json:"scan_on_startup"`
-	IdlePauseEnabled   *bool    `yaml:"idle_pause_enabled" json:"idle_pause_enabled"`
-	IdleTimeoutMinutes int      `yaml:"idle_timeout_minutes" json:"idle_timeout_minutes"`
+	IntervalSeconds          int      `yaml:"interval_seconds" json:"interval_seconds"`
+	Model                    string   `yaml:"model" json:"model"`
+	CLIVersion               string   `yaml:"cli_version" json:"cli_version"`
+	ManagementBase           string   `yaml:"management_base" json:"management_base"`
+	ManagementKey            string   `yaml:"management_key" json:"management_key"`
+	ProbeEnabled             *bool    `yaml:"probe_enabled" json:"probe_enabled"`
+	AutoDelete               *bool    `yaml:"auto_delete" json:"auto_delete"`
+	DryRun                   bool     `yaml:"dry_run" json:"dry_run"`
+	DeleteStatus             []int    `yaml:"delete_status_codes" json:"delete_status_codes"`
+	Providers                []string `yaml:"providers" json:"providers"`
+	Concurrency              int      `yaml:"concurrency" json:"concurrency"`
+	ProbeDelayMS             int      `yaml:"probe_delay_ms" json:"probe_delay_ms"`
+	LightProbe               *bool    `yaml:"light_probe" json:"light_probe"`
+	ScanOnStartup            *bool    `yaml:"scan_on_startup" json:"scan_on_startup"`
+	IdlePauseEnabled         *bool    `yaml:"idle_pause_enabled" json:"idle_pause_enabled"`
+	IdleTimeoutMinutes       int      `yaml:"idle_timeout_minutes" json:"idle_timeout_minutes"`
+	RequireUserTraffic       *bool    `yaml:"require_user_traffic" json:"require_user_traffic"`
+	HardFailureConfirmations int      `yaml:"hard_failure_confirmations" json:"hard_failure_confirmations"`
 }
 
 type authListResponse struct {
 	Files []pluginapi.HostAuthFileEntry `json:"files"`
-}
-
-type xaiAuthFile struct {
-	Type         string            `json:"type"`
-	Email        string            `json:"email"`
-	AccessToken  string            `json:"access_token"`
-	BaseURL      string            `json:"base_url"`
-	Headers      map[string]string `json:"headers"`
-	Disabled     bool              `json:"disabled"`
-	RefreshToken string            `json:"refresh_token"`
 }
 
 type probeResult struct {
@@ -217,17 +208,24 @@ type hostHTTPResponse struct {
 }
 
 var (
-	currentConfig atomic.Value
-	workerMu      sync.Mutex
-	stopCh        chan struct{}
-	running       atomic.Bool
-	workerStarted atomic.Bool
-	lastSummary   atomic.Value
+	currentConfig      atomic.Value
+	workerMu           sync.Mutex
+	stopCh             chan struct{}
+	running            atomic.Bool
+	workerStarted      atomic.Bool
+	lastSummary        atomic.Value
 	scanInFlight       atomic.Bool
 	lastScanUnix       atomic.Int64
 	lastUserActiveUnix atomic.Int64
 	idlePaused         atomic.Bool
+	hardFailureMu      sync.Mutex
+	hardFailures       = make(map[string]hardFailureState)
 )
+
+type hardFailureState struct {
+	Reason string
+	Count  int
+}
 
 func main() {}
 
@@ -297,7 +295,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Resources: []managementResource{{
 				Path:        resourcePath,
 				Menu:        "XAI Health Janitor",
-				Description: "Periodically probes xAI/Grok auths and deletes 401/402/403 hard failures. Rate-limited accounts are kept.",
+				Description: "Passively reads CPA status/status_message and deletes confirmed 401/402/403 failures. Rate-limited accounts are kept.",
 			}},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -308,27 +306,30 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 func defaultConfig() pluginConfig {
-	probe := true
+	probe := false
 	autoDelete := true
 	light := true
 	startup := false
 	idlePause := true
+	requireTraffic := true
 	return pluginConfig{
-		IntervalSeconds:    defaultIntervalSec,
-		Model:              defaultModel,
-		CLIVersion:         defaultCLIVersion,
-		ManagementBase:     defaultMgmtBase,
-		ProbeEnabled:       &probe,
-		AutoDelete:         &autoDelete,
-		DryRun:             false,
-		DeleteStatus:       []int{401, 402, 403},
-		Providers:          []string{"xai"},
-		Concurrency:        1,
-		ProbeDelayMS:       800,
-		LightProbe:         &light,
-		ScanOnStartup:      &startup,
-		IdlePauseEnabled:   &idlePause,
-		IdleTimeoutMinutes: 30,
+		IntervalSeconds:          defaultIntervalSec,
+		Model:                    defaultModel,
+		CLIVersion:               defaultCLIVersion,
+		ManagementBase:           defaultMgmtBase,
+		ProbeEnabled:             &probe,
+		AutoDelete:               &autoDelete,
+		DryRun:                   false,
+		DeleteStatus:             []int{401, 402, 403},
+		Providers:                []string{"xai"},
+		Concurrency:              1,
+		ProbeDelayMS:             800,
+		LightProbe:               &light,
+		ScanOnStartup:            &startup,
+		IdlePauseEnabled:         &idlePause,
+		IdleTimeoutMinutes:       30,
+		RequireUserTraffic:       &requireTraffic,
+		HardFailureConfirmations: 2,
 	}
 }
 
@@ -384,7 +385,7 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 		cfg.Concurrency = 1
 	}
 	if cfg.Concurrency > 3 {
-		// Cap hard: full-pool chat probes easily starve live sessions.
+		// Retained only to accept older configurations.
 		cfg.Concurrency = 3
 	}
 	if cfg.ProbeDelayMS < 0 {
@@ -393,10 +394,10 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	if cfg.ProbeDelayMS == 0 {
 		cfg.ProbeDelayMS = 800
 	}
-	if cfg.ProbeEnabled == nil {
-		v := true
-		cfg.ProbeEnabled = &v
-	}
+	// Active upstream probing is intentionally unsupported. Keep this legacy
+	// field false even when an older configuration still contains true.
+	v := false
+	cfg.ProbeEnabled = &v
 	if cfg.AutoDelete == nil {
 		v := true
 		cfg.AutoDelete = &v
@@ -419,6 +420,16 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 	if cfg.IdleTimeoutMinutes < 5 {
 		cfg.IdleTimeoutMinutes = 5
 	}
+	if cfg.RequireUserTraffic == nil {
+		v := true
+		cfg.RequireUserTraffic = &v
+	}
+	if cfg.HardFailureConfirmations <= 0 {
+		cfg.HardFailureConfirmations = 2
+	}
+	if cfg.HardFailureConfirmations > 3 {
+		cfg.HardFailureConfirmations = 3
+	}
 	return cfg
 }
 
@@ -440,20 +451,22 @@ func pluginRegistration() registration {
 			Author:           "local",
 			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Scan interval in seconds (min 30, default 300)."},
-				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "Probe model id (default grok-4.5)."},
-				{Name: "cli_version", Type: pluginapi.ConfigFieldTypeString, Description: "x-grok-client-version header for cli-chat-proxy."},
+				{Name: "interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Passive status scan interval in seconds (min 30, default 600)."},
+				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "Legacy setting retained for configuration compatibility."},
+				{Name: "cli_version", Type: pluginapi.ConfigFieldTypeString, Description: "Legacy setting retained for configuration compatibility."},
 				{Name: "management_base", Type: pluginapi.ConfigFieldTypeString, Description: "CPA management base URL used for DELETE auth-files."},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA remote-management secret key used to delete auth files."},
-				{Name: "probe_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Actually call upstream chat endpoint for each xAI auth."},
-				{Name: "auto_delete", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Delete unhealthy auths automatically."},
+				{Name: "probe_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Deprecated and ignored. The plugin is passive only."},
+				{Name: "auto_delete", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Delete confirmed unhealthy auths automatically."},
 				{Name: "dry_run", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Only report unhealthy auths, never delete."},
-				{Name: "concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Probe concurrency (1-3, default 1)."},
-				{Name: "probe_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Delay between probes in ms (default 800)."},
-				{Name: "light_probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Use lightweight probe payload to reduce rate-limit impact."},
+				{Name: "concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Legacy setting retained for configuration compatibility."},
+				{Name: "probe_delay_ms", Type: pluginapi.ConfigFieldTypeInteger, Description: "Legacy setting retained for configuration compatibility."},
+				{Name: "light_probe", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Legacy setting retained for configuration compatibility."},
 				{Name: "scan_on_startup", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Run one scan shortly after plugin start (default false)."},
 				{Name: "idle_pause_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Skip timer scans when CPA has no recent xAI user traffic."},
 				{Name: "idle_timeout_minutes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Minutes without user traffic before auto-pause (default 30)."},
+				{Name: "require_user_traffic", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Do not inspect statuses unless CPA observed recent real xAI user traffic."},
+				{Name: "hard_failure_confirmations", Type: pluginapi.ConfigFieldTypeInteger, Description: "Matching hard failures required before deletion (default 2)."},
 			},
 		},
 		Capabilities: registrationCapabilities{ManagementAPI: true},
@@ -535,7 +548,7 @@ func runScan(triggeredBy string) *runSummary {
 	}
 	defer scanInFlight.Store(false)
 
-	// Debounce: auth uploads/deletes used to re-trigger dense full-pool probes.
+	// Debounce auth-file changes so repeated local status scans do not churn CPA.
 	if triggeredBy != "manual" {
 		last := lastScanUnix.Load()
 		now := time.Now().Unix()
@@ -574,34 +587,6 @@ func runScan(triggeredBy string) *runSummary {
 		summary.LastUserActive = time.Unix(v, 0).UTC().Format(time.RFC3339)
 	}
 
-	// Idle auto-pause: timer scans only. Manual always runs.
-	if triggeredBy == "timer" && boolVal(cfg.IdlePauseEnabled, true) {
-		idleFor := int64(cfg.IdleTimeoutMinutes) * 60
-		now := time.Now().Unix()
-		activeAt := lastUserActiveUnix.Load()
-		if traffic == 0 && (activeAt == 0 || now-activeAt >= idleFor) {
-			idlePaused.Store(true)
-			summary.IdlePaused = true
-			summary.IdleReason = fmt.Sprintf("idle >= %dm, no CPA xAI user traffic", cfg.IdleTimeoutMinutes)
-			summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-			summary.DurationMS = time.Since(started).Milliseconds()
-			// Count current pool size for dashboard without probing.
-			for _, f := range files {
-				if f.Disabled || f.RuntimeOnly {
-					continue
-				}
-				if isTargetProvider(f, cfg.Providers) {
-					summary.Total++
-				}
-			}
-			lastSummary.Store(summary)
-			hostLog("info", fmt.Sprintf("%s: timer scan paused (%s)", pluginName, summary.IdleReason))
-			return summary
-		}
-	}
-	idlePaused.Store(false)
-	hostLog("info", fmt.Sprintf("%s: scan start (%s) user_traffic=%d", pluginName, triggeredBy, traffic))
-
 	targets := make([]pluginapi.HostAuthFileEntry, 0)
 	for _, f := range files {
 		if f.Disabled || f.RuntimeOnly {
@@ -613,80 +598,80 @@ func runScan(triggeredBy string) *runSummary {
 		targets = append(targets, f)
 	}
 	summary.Total = len(targets)
-
-	type job struct {
-		file pluginapi.HostAuthFileEntry
+	if len(targets) == 0 {
+		return finishScan(summary, started, "no eligible xAI auth files")
 	}
-	jobs := make(chan job)
-	results := make(chan probeResult, len(targets))
-	var wg sync.WaitGroup
-	workers := cfg.Concurrency
-	if workers > len(targets) && len(targets) > 0 {
-		workers = len(targets)
+	// Manual scans obey the real-traffic gate too, so an idle pool stays idle.
+	if boolVal(cfg.RequireUserTraffic, true) && traffic == 0 {
+		idlePaused.Store(true)
+		summary.IdlePaused = true
+		summary.IdleReason = "no recent CPA xAI user traffic"
+		return finishScan(summary, started, summary.IdleReason)
 	}
-	if workers < 1 {
-		workers = 1
-	}
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				results <- inspectAuth(cfg, j.file)
-			}
-		}()
-	}
-	go func() {
-		for _, f := range targets {
-			jobs <- job{file: f}
-		}
-		close(jobs)
-		wg.Wait()
-		close(results)
-	}()
-
-	for item := range results {
-		item.Category = categoryOf(item)
-		summary.Results = append(summary.Results, item)
-		switch item.Category {
-		case "healthy":
-			summary.Healthy++
-		case "http_402":
-			summary.Count402++
-			summary.Unhealthy++
-		case "http_403":
-			summary.Count403++
-			summary.Unhealthy++
-		case "http_401":
-			summary.Count401++
-			summary.Unhealthy++
-		case "rate_limit":
-			summary.CountRateLimit++
-			summary.Unhealthy++
-		case "error":
-			summary.Errors++
-		default:
-			if item.Action == "keep" {
-				summary.Healthy++
-			} else if item.Action == "deleted" || item.Action == "would_delete" || item.Action == "delete_failed" {
-				summary.CountOtherBad++
-				summary.Unhealthy++
-			} else {
-				summary.Skipped++
-			}
-		}
-		if item.Deleted {
-			summary.Deleted++
-		}
+	if boolVal(cfg.IdlePauseEnabled, true) && traffic == 0 {
+		idlePaused.Store(true)
+		summary.IdlePaused = true
+		summary.IdleReason = fmt.Sprintf("idle >= %dm, no CPA xAI user traffic", cfg.IdleTimeoutMinutes)
+		return finishScan(summary, started, summary.IdleReason)
 	}
 
+	idlePaused.Store(false)
+	hostLog("info", fmt.Sprintf("%s: passive scan start (%s) user_traffic=%d accounts=%d", pluginName, triggeredBy, traffic, len(targets)))
+	for _, file := range targets {
+		item := inspectAuth(cfg, file)
+		addResult(summary, item)
+	}
+
+	return finishScan(summary, started, "")
+}
+
+func finishScan(summary *runSummary, started time.Time, note string) *runSummary {
 	summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 	summary.DurationMS = time.Since(started).Milliseconds()
 	lastSummary.Store(summary)
 	lastScanUnix.Store(time.Now().Unix())
-	hostLog("info", fmt.Sprintf("%s: scan done total=%d healthy=%d unhealthy=%d deleted=%d errors=%d dry_run=%v",
-		pluginName, summary.Total, summary.Healthy, summary.Unhealthy, summary.Deleted, summary.Errors, summary.DryRun))
+	if note != "" {
+		hostLog("info", fmt.Sprintf("%s: scan paused (%s)", pluginName, note))
+	} else {
+		hostLog("info", fmt.Sprintf("%s: scan done pool=%d checked=%d healthy=%d unhealthy=%d deleted=%d errors=%d dry_run=%v",
+			pluginName, summary.Total, len(summary.Results), summary.Healthy, summary.Unhealthy, summary.Deleted, summary.Errors, summary.DryRun))
+	}
 	return summary
+}
+
+func addResult(summary *runSummary, item probeResult) {
+	item.Category = categoryOf(item)
+	summary.Results = append(summary.Results, item)
+	switch item.Category {
+	case "healthy":
+		summary.Healthy++
+	case "http_402":
+		summary.Count402++
+		summary.Unhealthy++
+	case "http_403":
+		summary.Count403++
+		summary.Unhealthy++
+	case "http_401":
+		summary.Count401++
+		summary.Unhealthy++
+	case "rate_limit":
+		summary.CountRateLimit++
+		summary.Unhealthy++
+	case "error":
+		summary.Errors++
+	default:
+		if item.Action == "keep" {
+			summary.Healthy++
+		} else if item.Action == "deleted" || item.Action == "would_delete" || item.Action == "delete_failed" {
+			summary.CountOtherBad++
+			summary.Unhealthy++
+		} else {
+			summary.Skipped++
+		}
+	}
+	if item.Deleted {
+		summary.Deleted++
+	}
 }
 
 func isTargetProvider(f pluginapi.HostAuthFileEntry, providers []string) bool {
@@ -760,130 +745,16 @@ func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult
 		CheckedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// Fast path: management status already shows hard failure text.
-	if reason := classifyText(file.StatusMessage); reason != "" {
+	// Passive-only: these values are written by real CLIProxyAPI requests. Do not
+	// fetch credentials or call xAI here; doing so is exactly what this plugin avoids.
+	if reason := classifyRecordedStatus(file.Status, file.StatusMessage); reason != "" {
 		result.Reason = reason
 		return maybeDelete(cfg, result)
 	}
-	if strings.EqualFold(file.Status, "error") && strings.TrimSpace(file.StatusMessage) != "" {
-		if reason := classifyText(file.StatusMessage); reason != "" {
-			result.Reason = reason
-			return maybeDelete(cfg, result)
-		}
-	}
-
-	if !boolVal(cfg.ProbeEnabled, true) {
-		result.Action = "keep"
-		result.Reason = "probe_disabled"
-		return result
-	}
-
-	authJSON, name, errGet := callHostAuthGet(file.AuthIndex)
-	if errGet != nil {
-		result.Error = "host.auth.get: " + errGet.Error()
-		return result
-	}
-	if name != "" {
-		result.Name = name
-	}
-	var auth xaiAuthFile
-	if errUnmarshal := json.Unmarshal(authJSON, &auth); errUnmarshal != nil {
-		result.Error = "decode auth json: " + errUnmarshal.Error()
-		return result
-	}
-	if auth.Email != "" {
-		result.Email = auth.Email
-	}
-	token := strings.TrimSpace(auth.AccessToken)
-	if token == "" {
-		result.Reason = "missing_access_token"
-		return maybeDelete(cfg, result)
-	}
-
-	baseURL := strings.TrimRight(strings.TrimSpace(auth.BaseURL), "/")
-	if baseURL == "" {
-		baseURL = defaultBaseURL
-	}
-	cliVersion := cfg.CLIVersion
-	if auth.Headers != nil {
-		if v := strings.TrimSpace(auth.Headers["x-grok-client-version"]); v != "" {
-			cliVersion = v
-		}
-	}
-
-	// Stagger probes so live user sessions are less likely to get rate-limited.
-	if cfg.ProbeDelayMS > 0 {
-		time.Sleep(time.Duration(cfg.ProbeDelayMS) * time.Millisecond)
-	}
-
-	var body []byte
-	var probeURL string
-	headers := map[string][]string{
-		"Authorization":         {"Bearer " + token},
-		"Accept":                {"application/json"},
-		"x-grok-client-version": {cliVersion},
-		"User-Agent":            {"xai-health-janitor/" + pluginVersion},
-	}
-	// Light probe: GET /v1/user catches many auth failures cheaply.
-	// NOTE: /user 200 does NOT prove chat works (chat may still 403). Always do a
-	// tiny chat probe after /user success so dead free accounts still get deleted.
-	if boolVal(cfg.LightProbe, true) {
-		probeURL = baseURL + "/user"
-		respUser, errUser := callHostHTTP("GET", probeURL, headers, nil)
-		if errUser != nil {
-			result.Error = "probe user: " + errUser.Error()
-			result.Action = "keep"
-			return result
-		}
-		result.ProbeHTTP = respUser.StatusCode
-		result.ProbeBody = trimBody(respUser.Body, 300)
-		if respUser.StatusCode < 200 || respUser.StatusCode >= 300 {
-			reason := classifyStatus(respUser.StatusCode, string(respUser.Body), cfg.DeleteStatus)
-			if reason != "" {
-				result.Reason = reason
-				return maybeDelete(cfg, result)
-			}
-			// Non-fatal on /user: continue to chat probe.
-		}
-	}
-
-	probeURL = baseURL + "/chat/completions"
-	headers["Content-Type"] = []string{"application/json"}
-	body, _ = json.Marshal(map[string]any{
-		"model": cfg.Model,
-		"messages": []map[string]string{
-			{"role": "user", "content": "ok"},
-		},
-		"max_tokens": 1,
-	})
-	resp, errHTTP := callHostHTTP("POST", probeURL, headers, body)
-	if errHTTP != nil {
-		// Network failures should not delete accounts.
-		result.Error = "probe: " + errHTTP.Error()
-		result.Action = "keep"
-		return result
-	}
-	result.ProbeHTTP = resp.StatusCode
-	result.ProbeBody = trimBody(resp.Body, 300)
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		var parsed map[string]any
-		_ = json.Unmarshal(resp.Body, &parsed)
-		if model, ok := parsed["model"].(string); ok {
-			result.Model = model
-		}
-		result.Action = "keep"
-		result.Reason = "healthy"
-		return result
-	}
-
-	reason := classifyStatus(resp.StatusCode, string(resp.Body), cfg.DeleteStatus)
-	if reason == "" {
-		result.Action = "keep"
-		result.Reason = fmt.Sprintf("non_fatal_http_%d", resp.StatusCode)
-		return result
-	}
-	result.Reason = reason
-	return maybeDelete(cfg, result)
+	clearHardFailure(result.Name)
+	result.Action = "keep"
+	result.Reason = "no_explicit_failure_status"
+	return result
 }
 
 func isRateLimitOnly(result probeResult) bool {
@@ -915,6 +786,11 @@ func maybeDelete(cfg pluginConfig, result probeResult) probeResult {
 		}
 		return result
 	}
+	if !confirmHardFailure(result.Name, result.Reason, cfg.HardFailureConfirmations) {
+		result.Action = "keep"
+		result.Reason += ":pending_confirmation"
+		return result
+	}
 	if !boolVal(cfg.AutoDelete, true) || cfg.DryRun {
 		result.Action = "would_delete"
 		return result
@@ -941,6 +817,54 @@ func maybeDelete(cfg pluginConfig, result probeResult) probeResult {
 	return result
 }
 
+func classifyRecordedStatus(status, message string) string {
+	if reason := classifyText(message); reason != "" {
+		return reason
+	}
+	lower := strings.ToLower(status + " " + message)
+	switch {
+	case strings.Contains(lower, "http 429"), strings.Contains(lower, "http_429"), strings.Contains(lower, "status=429"):
+		return "rate_limited"
+	case strings.Contains(lower, "http 403"), strings.Contains(lower, "http_403"), strings.Contains(lower, "status=403"):
+		return "permission_denied"
+	case strings.Contains(lower, "http 402"), strings.Contains(lower, "http_402"), strings.Contains(lower, "status=402"):
+		return "spending_limit"
+	case strings.Contains(lower, "http 401"), strings.Contains(lower, "http_401"), strings.Contains(lower, "status=401"):
+		return "auth_invalid"
+	default:
+		return ""
+	}
+}
+
+func confirmHardFailure(name, reason string, needed int) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if needed <= 1 {
+		return true
+	}
+	hardFailureMu.Lock()
+	defer hardFailureMu.Unlock()
+	previous := hardFailures[name]
+	if previous.Reason == reason {
+		previous.Count++
+	} else {
+		previous = hardFailureState{Reason: reason, Count: 1}
+	}
+	hardFailures[name] = previous
+	return previous.Count >= needed
+}
+
+func clearHardFailure(name string) {
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	hardFailureMu.Lock()
+	delete(hardFailures, name)
+	hardFailureMu.Unlock()
+}
+
 func deleteAuthFile(cfg pluginConfig, name string) error {
 	endpoint := cfg.ManagementBase + "/v0/management/auth-files?name=" + url.QueryEscape(name)
 	headers := map[string][]string{
@@ -955,24 +879,6 @@ func deleteAuthFile(cfg pluginConfig, name string) error {
 		return nil
 	}
 	return fmt.Errorf("delete HTTP %d: %s", resp.StatusCode, trimBody(resp.Body, 200))
-}
-
-func classifyStatus(code int, body string, deleteCodes []int) string {
-	for _, want := range deleteCodes {
-		if code == want {
-			if textReason := classifyText(body); textReason != "" {
-				return fmt.Sprintf("http_%d:%s", code, textReason)
-			}
-			return fmt.Sprintf("http_%d", code)
-		}
-	}
-	if textReason := classifyText(body); textReason != "" {
-		// Text-based hard failures even if status is unexpected.
-		if code == 401 || code == 402 || code == 403 || code == 429 {
-			return fmt.Sprintf("http_%d:%s", code, textReason)
-		}
-	}
-	return ""
 }
 
 func classifyText(text string) string {
@@ -1320,24 +1226,26 @@ func persistPluginConfig(cfg pluginConfig) string {
 		return "未配置 management_key，仅运行时生效，重启后可能丢失。"
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"enabled":             true,
-		"priority":            1,
-		"interval_seconds":    cfg.IntervalSeconds,
-		"model":               cfg.Model,
-		"cli_version":         cfg.CLIVersion,
-		"management_base":     cfg.ManagementBase,
-		"management_key":      cfg.ManagementKey,
-		"probe_enabled":       boolVal(cfg.ProbeEnabled, true),
-		"auto_delete":         boolVal(cfg.AutoDelete, true),
-		"dry_run":             cfg.DryRun,
-		"concurrency":         cfg.Concurrency,
-		"probe_delay_ms":      cfg.ProbeDelayMS,
-		"light_probe":          boolVal(cfg.LightProbe, true),
-		"scan_on_startup":      boolVal(cfg.ScanOnStartup, false),
-		"idle_pause_enabled":   boolVal(cfg.IdlePauseEnabled, true),
-		"idle_timeout_minutes": cfg.IdleTimeoutMinutes,
-		"delete_status_codes":  cfg.DeleteStatus,
-		"providers":            cfg.Providers,
+		"enabled":                    true,
+		"priority":                   1,
+		"interval_seconds":           cfg.IntervalSeconds,
+		"model":                      cfg.Model,
+		"cli_version":                cfg.CLIVersion,
+		"management_base":            cfg.ManagementBase,
+		"management_key":             cfg.ManagementKey,
+		"probe_enabled":              boolVal(cfg.ProbeEnabled, false),
+		"auto_delete":                boolVal(cfg.AutoDelete, false),
+		"dry_run":                    cfg.DryRun,
+		"concurrency":                cfg.Concurrency,
+		"probe_delay_ms":             cfg.ProbeDelayMS,
+		"light_probe":                boolVal(cfg.LightProbe, true),
+		"scan_on_startup":            boolVal(cfg.ScanOnStartup, false),
+		"idle_pause_enabled":         boolVal(cfg.IdlePauseEnabled, true),
+		"idle_timeout_minutes":       cfg.IdleTimeoutMinutes,
+		"require_user_traffic":       boolVal(cfg.RequireUserTraffic, true),
+		"hard_failure_confirmations": cfg.HardFailureConfirmations,
+		"delete_status_codes":        cfg.DeleteStatus,
+		"providers":                  cfg.Providers,
 	})
 	endpoint := strings.TrimRight(cfg.ManagementBase, "/") + "/v0/management/plugins/" + pluginName + "/config"
 	headers := map[string][]string{
@@ -1377,23 +1285,25 @@ func sanitizeConfig(cfg pluginConfig) map[string]any {
 		}
 	}
 	return map[string]any{
-		"interval_seconds":    cfg.IntervalSeconds,
-		"model":               cfg.Model,
-		"cli_version":         cfg.CLIVersion,
-		"management_base":     cfg.ManagementBase,
-		"management_key":      key,
-		"probe_enabled":       boolVal(cfg.ProbeEnabled, true),
-		"auto_delete":         boolVal(cfg.AutoDelete, true),
-		"dry_run":             cfg.DryRun,
-		"delete_status_codes": cfg.DeleteStatus,
-		"providers":           cfg.Providers,
-		"concurrency":          cfg.Concurrency,
-		"probe_delay_ms":       cfg.ProbeDelayMS,
-		"light_probe":          boolVal(cfg.LightProbe, true),
-		"scan_on_startup":      boolVal(cfg.ScanOnStartup, false),
-		"idle_pause_enabled":   boolVal(cfg.IdlePauseEnabled, true),
-		"idle_timeout_minutes": cfg.IdleTimeoutMinutes,
-		"idle_paused_now":      idlePaused.Load(),
+		"interval_seconds":           cfg.IntervalSeconds,
+		"model":                      cfg.Model,
+		"cli_version":                cfg.CLIVersion,
+		"management_base":            cfg.ManagementBase,
+		"management_key":             key,
+		"probe_enabled":              boolVal(cfg.ProbeEnabled, false),
+		"auto_delete":                boolVal(cfg.AutoDelete, false),
+		"dry_run":                    cfg.DryRun,
+		"delete_status_codes":        cfg.DeleteStatus,
+		"providers":                  cfg.Providers,
+		"concurrency":                cfg.Concurrency,
+		"probe_delay_ms":             cfg.ProbeDelayMS,
+		"light_probe":                boolVal(cfg.LightProbe, true),
+		"scan_on_startup":            boolVal(cfg.ScanOnStartup, false),
+		"idle_pause_enabled":         boolVal(cfg.IdlePauseEnabled, true),
+		"idle_timeout_minutes":       cfg.IdleTimeoutMinutes,
+		"require_user_traffic":       boolVal(cfg.RequireUserTraffic, true),
+		"hard_failure_confirmations": cfg.HardFailureConfirmations,
+		"idle_paused_now":            idlePaused.Load(),
 	}
 }
 
@@ -1456,7 +1366,7 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 @media (max-width:640px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}header{flex-direction:column}}
 </style></head><body><div class="wrap">`)
 
-	out.WriteString(`<header><div><h1>XAI Health Janitor</h1><p class="sub">定时探测 Grok/xAI 账号；402 / 401 / 403 / 限流自动删除</p></div><div class="actions">`)
+	out.WriteString(`<header><div><h1>XAI Health Janitor</h1><p class="sub">仅在真实 xAI 流量存在时读取 CPA 状态；不主动请求 xAI</p></div><div class="actions">`)
 	out.WriteString(`<a class="btn btn-primary" href="?op=scan">立即扫描</a>`)
 	out.WriteString(`<a class="btn" href="?op=status">刷新</a>`)
 	out.WriteString(`<a class="btn" href="?op=status&format=json">JSON</a></div></header>`)
@@ -1483,13 +1393,9 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<section class="panel"><h2>扫描设置</h2>`)
 	out.WriteString(`<form class="form" method="post" action="?op=save_settings">`)
 	out.WriteString(`<div class="field"><label>轮询间隔（秒）</label><input type="number" name="interval_seconds" min="30" step="30" value="` + fmt.Sprintf("%d", cfg.IntervalSeconds) + `"></div>`)
-	out.WriteString(`<div class="field"><label>并发数（建议 1）</label><input type="number" name="concurrency" min="1" max="3" value="` + fmt.Sprintf("%d", cfg.Concurrency) + `"></div>`)
-	out.WriteString(`<div class="field"><label>探测间隔 ms</label><input type="number" name="probe_delay_ms" min="0" step="100" value="` + fmt.Sprintf("%d", cfg.ProbeDelayMS) + `"></div>`)
-	out.WriteString(`<div class="field"><label>探测模型</label><input type="text" name="model" value="` + html.EscapeString(cfg.Model) + `"></div>`)
-	out.WriteString(`<div class="field"><label>CLI Version 头</label><input type="text" name="cli_version" value="` + html.EscapeString(cfg.CLIVersion) + `"></div>`)
+	out.WriteString(`<div class="field"><label>扫描并发</label><input type="number" value="本地被动读取" readonly></div>`)
 	out.WriteString(`<div class="checks">`)
-	out.WriteString(checkBox("probe_enabled", "启用探测", boolVal(cfg.ProbeEnabled, true)))
-	out.WriteString(checkBox("light_probe", "轻量探测(/user优先)", boolVal(cfg.LightProbe, true)))
+	out.WriteString(`<span class="pill">仅被动读取 CPA 状态，不请求 xAI</span>`)
 	out.WriteString(checkBox("auto_delete", "自动删除异常号", boolVal(cfg.AutoDelete, true)))
 	out.WriteString(checkBox("dry_run", "仅演练(不删除)", cfg.DryRun))
 	out.WriteString(checkBox("scan_on_startup", "启动时自动扫描", boolVal(cfg.ScanOnStartup, false)))
@@ -1497,7 +1403,7 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<div class="field"><label>闲置多久暂停（分钟）</label><input type="number" name="idle_timeout_minutes" min="5" step="5" value="` + fmt.Sprintf("%d", cfg.IdleTimeoutMinutes) + `"></div>`)
 	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
 	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">闲置暂停：无用户流量超时后定时扫描自动停。探测：先 /user 再极小 chat。自动删除：401/402/403（硬失败）。限流/额度耗尽(429)只标记不删除。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
+	out.WriteString(`<p class="muted" style="margin:12px 0 0">安全策略：没有真实 xAI 用户流量则完全闲置；插件不请求 xAI，仅根据 CPA 真实请求写入的 status/status_message 清理明确失效账号。429/限流始终保留；401/402/403 类硬失败需连续 ` + fmt.Sprintf("%d", cfg.HardFailureConfirmations) + ` 次才可能删除。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
 	out.WriteString(`</section>`)
 
 	// last scan panel
@@ -1636,18 +1542,6 @@ func callHostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 		return nil, fmt.Errorf("decode host.auth.list: %w", errUnmarshal)
 	}
 	return resp.Files, nil
-}
-
-func callHostAuthGet(authIndex string) (json.RawMessage, string, error) {
-	result, errCall := callHost(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: authIndex})
-	if errCall != nil {
-		return nil, "", errCall
-	}
-	var resp pluginapi.HostAuthGetResponse
-	if errUnmarshal := json.Unmarshal(result, &resp); errUnmarshal != nil {
-		return nil, "", fmt.Errorf("decode host.auth.get: %w", errUnmarshal)
-	}
-	return resp.JSON, resp.Name, nil
 }
 
 func callHostHTTP(method, rawURL string, headers map[string][]string, body []byte) (hostHTTPResponse, error) {

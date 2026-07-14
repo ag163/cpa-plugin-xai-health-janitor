@@ -1,16 +1,16 @@
 # XAI Health Janitor
 
-CLIProxyAPI 插件：定时探测 xAI/Grok 账号健康状态，自动删除 402 / 401 / 403 / 限流账号，并提供可视化管理面板。
+CLIProxyAPI 插件：只读取真实 xAI 请求已写入的账号状态，清理确认失效的 401 / 402 / 403 账号；绝不主动请求 xAI。
 
 ## 功能
 
-- 定时扫描 CPA 内所有 `xai` 账号
-- 直连上游 `chat/completions` 探测（自动带 `x-grok-client-version`）
-- 自动删除：
+- 没有近期真实 xAI 用户流量时完全闲置
+- 定时读取 CPA 内所有 `xai` 账号的 `status` / `status_message`
+- 仅在连续两次出现明确硬失败时自动删除：
   - HTTP **402** spending-limit
   - HTTP **403** permission-denied
   - HTTP **401** auth invalid
-  - HTTP **429** rate limit
+- HTTP **429**、`rate limit`、`usage exhausted` 仅保留和展示，绝不删除
 - 可视化面板：
   - 总账号 / 正常 / 异常
   - 402 / 403 / 401+限流 分类统计
@@ -50,17 +50,19 @@ plugins:
     xai-health-janitor:
       enabled: true
       priority: 1
-      interval_seconds: 300
+      interval_seconds: 600
       model: "grok-4.5"
       cli_version: "0.1.220"
       management_base: "http://127.0.0.1:8317"
       management_key: "你的 remote-management.secret-key"
-      probe_enabled: true
+      # Legacy field. The plugin never performs upstream probes.
+      probe_enabled: false
       auto_delete: true
       dry_run: false
-      concurrency: 3
-      delete_status_codes: [402, 403, 429]
+      delete_status_codes: [401, 402, 403]
       providers: ["xai"]
+      require_user_traffic: true
+      hard_failure_confirmations: 2
 ```
 
 ### 3. 重启 / 热加载 CPA
@@ -92,17 +94,17 @@ CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `interval_seconds` | 300 | 扫描间隔，最小 30 |
-| `model` | `grok-4.5` | 探测模型 |
-| `cli_version` | `0.1.220` | free 通道必需请求头 |
+| `interval_seconds` | 600 | 本地状态检查间隔，最小 30 |
 | `management_base` | `http://127.0.0.1:8317` | 删除接口地址 |
 | `management_key` | 空 | **删除必须配置** |
-| `probe_enabled` | true | 是否真实请求上游 |
-| `auto_delete` | true | 是否自动删除 |
+| `probe_enabled` | false | 兼容旧配置；主动上游探测已被永久禁用 |
+| `auto_delete` | true | 是否自动删除已确认的硬失败账号 |
 | `dry_run` | false | 只报告不删除 |
-| `concurrency` | 3 | 并发探测数 |
+| `require_user_traffic` | true | 无真实 xAI 用户流量时完全闲置 |
+| `hard_failure_confirmations` | 2 | 删除前所需的相同硬失败次数 |
 
 ## 安全说明
 
 - 不要把 `management_key` 提交到仓库
 - 插件属于进程内可信代码，只安装你信任的 release
+- 插件不会调用 xAI 上游接口，因此不会因健康检查增加出口 IP 风控压力
