@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "xai-health-janitor"
-	pluginVersion       = "0.2.1"
+	pluginVersion       = "0.2.2"
 	resourcePath        = "/status"
 	resourceContentType = "text/html; charset=utf-8"
 	defaultModel        = "grok-4.5"
@@ -1364,7 +1364,6 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 </style></head><body><div class="wrap">`)
 
 	out.WriteString(`<header><div><h1>XAI Health Janitor</h1><p class="sub">仅在真实 xAI 流量存在时读取 CPA 状态；不主动请求 xAI</p></div><div class="actions">`)
-	out.WriteString(`<a class="btn btn-primary" href="?op=scan">立即扫描</a>`)
 	out.WriteString(`<a class="btn" href="?op=status">刷新</a>`)
 	out.WriteString(`<a class="btn" href="?op=status&format=json">JSON</a></div></header>`)
 
@@ -1379,36 +1378,21 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	// stats cards
 	out.WriteString(`<div class="grid">`)
 	writeStatCard(&out, "info", "总账号", fmt.Sprintf("%d", total), "当前池内 xAI 账号")
-	writeStatCard(&out, "ok", "正常", fmt.Sprintf("%d", healthy), "探测成功可调用")
+	writeStatCard(&out, "ok", "正常", fmt.Sprintf("%d", healthy), "无明确失效状态")
 	writeStatCard(&out, "bad", "异常", fmt.Sprintf("%d", unhealthy), "需关注/已处理")
 	writeStatCard(&out, "warn", "402 额度", fmt.Sprintf("%d", c402), "spending-limit")
 	writeStatCard(&out, "bad", "403 拒绝", fmt.Sprintf("%d", c403), "permission-denied")
 	writeStatCard(&out, "warn", "401/限流", fmt.Sprintf("%d", c401+c429), fmt.Sprintf("401=%d · 429=%d", c401, c429))
 	out.WriteString(`</div>`)
 
-	// settings panel
-	out.WriteString(`<section class="panel"><h2>扫描设置</h2>`)
-	out.WriteString(`<form class="form" method="post" action="?op=save_settings">`)
-	out.WriteString(`<div class="field"><label>轮询间隔（秒）</label><input type="number" name="interval_seconds" min="30" step="30" value="` + fmt.Sprintf("%d", cfg.IntervalSeconds) + `"></div>`)
-	out.WriteString(`<div class="field"><label>扫描并发</label><input type="number" value="本地被动读取" readonly></div>`)
-	out.WriteString(`<div class="checks">`)
-	out.WriteString(`<span class="pill">仅被动读取 CPA 状态，不请求 xAI</span>`)
-	out.WriteString(checkBox("auto_delete", "自动删除异常号", boolVal(cfg.AutoDelete, true)))
-	out.WriteString(checkBox("dry_run", "仅演练(不删除)", cfg.DryRun))
-	out.WriteString(checkBox("scan_on_startup", "启动时自动扫描", boolVal(cfg.ScanOnStartup, false)))
-	out.WriteString(checkBox("idle_pause_enabled", "闲置自动暂停", boolVal(cfg.IdlePauseEnabled, true)))
-	out.WriteString(`<div class="field"><label>闲置多久暂停（分钟）</label><input type="number" name="idle_timeout_minutes" min="5" step="5" value="` + fmt.Sprintf("%d", cfg.IdleTimeoutMinutes) + `"></div>`)
-	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
-	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">安全策略：没有真实 xAI 用户流量则完全闲置；插件不请求 xAI，仅根据 CPA 真实请求写入的 status/status_message 清理明确失效账号。429/限流始终保留；401/402/403 类硬失败需 ` + fmt.Sprintf("%d", cfg.HardFailureConfirmations) + ` 个不同真实失败事件才可能删除。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
-	out.WriteString(`</section>`)
+	out.WriteString(`<p class="muted" style="margin:0 0 18px">被动清理：无真实 xAI 流量时闲置；仅根据 CPA status/status_message 清理确认失效账号。429/限流保留；硬失败需 ` + fmt.Sprintf("%d", cfg.HardFailureConfirmations) + ` 个不同真实失败事件。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong> · 间隔 ` + fmt.Sprintf("%ds", cfg.IntervalSeconds) + ` · 自动删除 ` + fmt.Sprintf("%v", boolVal(cfg.AutoDelete, true)) + ` · dry_run ` + fmt.Sprintf("%v", cfg.DryRun) + `</p>`)
 
 	// last scan panel
-	out.WriteString(`<section class="panel"><h2>最近一次扫描</h2><div class="meta">`)
+	out.WriteString(`<section class="panel"><h2>最近一次检查</h2><div class="meta">`)
 	out.WriteString(`<span class="pill">触发：` + html.EscapeString(triggered) + `</span>`)
 	out.WriteString(`<span class="pill">完成：` + html.EscapeString(finished) + `</span>`)
 	out.WriteString(`<span class="pill">耗时：` + fmt.Sprintf("%dms", duration) + `</span>`)
-	out.WriteString(`<span class="pill">探测错误：` + fmt.Sprintf("%d", cErr) + `</span>`)
+	out.WriteString(`<span class="pill">读取错误：` + fmt.Sprintf("%d", cErr) + `</span>`)
 	if idlePaused.Load() {
 		out.WriteString(`<span class="pill" style="background:#fff7ed;color:#c2410c">状态：闲置已暂停</span>`)
 	} else {
@@ -1423,7 +1407,7 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`</div>`)
 
 	if summary == nil {
-		out.WriteString(`<p class="muted">还没有扫描结果。点击「立即扫描」开始。</p>`)
+		out.WriteString(`<p class="muted">还没有检查结果。有真实 xAI 流量后会按配置自动运行。</p>`)
 	} else {
 		if summary.LastError != "" {
 			out.WriteString(`<div class="notice bad">` + html.EscapeString(summary.LastError) + `</div>`)
@@ -1481,14 +1465,6 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 
 func writeStatCard(out *bytes.Buffer, tone, label, value, hint string) {
 	out.WriteString(`<div class="card ` + tone + `"><div class="label">` + html.EscapeString(label) + `</div><div class="value">` + html.EscapeString(value) + `</div><div class="hint">` + html.EscapeString(hint) + `</div></div>`)
-}
-
-func checkBox(name, label string, checked bool) string {
-	c := ""
-	if checked {
-		c = " checked"
-	}
-	return `<label><input type="hidden" name="` + name + `" value="false"><input type="checkbox" name="` + name + `" value="true"` + c + `> ` + html.EscapeString(label) + `</label>`
 }
 
 func displayCategory(cat string) string {

@@ -11,11 +11,10 @@ CLIProxyAPI 插件：只读取真实 xAI 请求已写入的账号状态，清理
   - HTTP **403** permission-denied
   - HTTP **401** auth invalid
 - HTTP **429**、`rate limit`、`usage exhausted` 仅保留和展示，绝不删除
-- 可视化面板：
+- 只读状态面板：
   - 总账号 / 正常 / 异常
   - 402 / 403 / 401+限流 分类统计
-  - 可修改轮询间隔、并发、自动删除开关
-  - 一键立即扫描
+  - 最近一次被动检查结果
 
 ## 面板地址
 
