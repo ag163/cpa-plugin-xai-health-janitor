@@ -59,7 +59,6 @@ plugins:
       probe_enabled: false
       auto_delete: true
       dry_run: false
-      delete_status_codes: [401, 402, 403]
       providers: ["xai"]
       require_user_traffic: true
       hard_failure_confirmations: 2
@@ -79,6 +78,12 @@ volumes:
 ```bash
 # 从 GitHub Release 安装到 /opt/cliproxyapi
 TAG=v0.1.0 bash scripts/install-from-github.sh
+```
+
+`deploy-on-server.sh` 需要从服务器环境传入管理密钥，绝不在仓库中保存：
+
+```bash
+CPA_MANAGEMENT_KEY='your-remote-management-plaintext-key' bash deploy-on-server.sh
 ```
 
 ## 本地构建
@@ -101,7 +106,7 @@ CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
 | `auto_delete` | true | 是否自动删除已确认的硬失败账号 |
 | `dry_run` | false | 只报告不删除 |
 | `require_user_traffic` | true | 无真实 xAI 用户流量时完全闲置 |
-| `hard_failure_confirmations` | 2 | 删除前所需的相同硬失败次数 |
+| `hard_failure_confirmations` | 2 | 删除前所需的不同真实失败事件数（以 CPA `updated_at` 区分） |
 
 ## 安全说明
 

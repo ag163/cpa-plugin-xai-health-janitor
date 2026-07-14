@@ -75,7 +75,7 @@ import (
 
 const (
 	pluginName          = "xai-health-janitor"
-	pluginVersion       = "0.2.0"
+	pluginVersion       = "0.2.1"
 	resourcePath        = "/status"
 	resourceContentType = "text/html; charset=utf-8"
 	defaultModel        = "grok-4.5"
@@ -142,7 +142,6 @@ type pluginConfig struct {
 	ProbeEnabled             *bool    `yaml:"probe_enabled" json:"probe_enabled"`
 	AutoDelete               *bool    `yaml:"auto_delete" json:"auto_delete"`
 	DryRun                   bool     `yaml:"dry_run" json:"dry_run"`
-	DeleteStatus             []int    `yaml:"delete_status_codes" json:"delete_status_codes"`
 	Providers                []string `yaml:"providers" json:"providers"`
 	Concurrency              int      `yaml:"concurrency" json:"concurrency"`
 	ProbeDelayMS             int      `yaml:"probe_delay_ms" json:"probe_delay_ms"`
@@ -223,8 +222,9 @@ var (
 )
 
 type hardFailureState struct {
-	Reason string
-	Count  int
+	Reason    string
+	UpdatedAt time.Time
+	Count     int
 }
 
 func main() {}
@@ -320,7 +320,6 @@ func defaultConfig() pluginConfig {
 		ProbeEnabled:             &probe,
 		AutoDelete:               &autoDelete,
 		DryRun:                   false,
-		DeleteStatus:             []int{401, 402, 403},
 		Providers:                []string{"xai"},
 		Concurrency:              1,
 		ProbeDelayMS:             800,
@@ -372,9 +371,6 @@ func normalizeConfig(cfg pluginConfig) pluginConfig {
 		cfg.ManagementBase = defaultMgmtBase
 	}
 	cfg.ManagementKey = strings.TrimSpace(cfg.ManagementKey)
-	if len(cfg.DeleteStatus) == 0 {
-		cfg.DeleteStatus = []int{401, 402, 403}
-	}
 	if len(cfg.Providers) == 0 {
 		cfg.Providers = []string{"xai"}
 	}
@@ -449,7 +445,7 @@ func pluginRegistration() registration {
 			Name:             pluginName,
 			Version:          pluginVersion,
 			Author:           "local",
-			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
+			GitHubRepository: "https://github.com/ag163/cpa-plugin-xai-health-janitor",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "interval_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Passive status scan interval in seconds (min 30, default 600)."},
 				{Name: "model", Type: pluginapi.ConfigFieldTypeString, Description: "Legacy setting retained for configuration compatibility."},
@@ -749,7 +745,7 @@ func inspectAuth(cfg pluginConfig, file pluginapi.HostAuthFileEntry) probeResult
 	// fetch credentials or call xAI here; doing so is exactly what this plugin avoids.
 	if reason := classifyRecordedStatus(file.Status, file.StatusMessage); reason != "" {
 		result.Reason = reason
-		return maybeDelete(cfg, result)
+		return maybeDelete(cfg, result, file.UpdatedAt)
 	}
 	clearHardFailure(result.Name)
 	result.Action = "keep"
@@ -772,7 +768,7 @@ func isRateLimitOnly(result probeResult) bool {
 		strings.Contains(blob, "http_429")
 }
 
-func maybeDelete(cfg pluginConfig, result probeResult) probeResult {
+func maybeDelete(cfg pluginConfig, result probeResult, updatedAt time.Time) probeResult {
 	if result.Reason == "" {
 		result.Action = "keep"
 		return result
@@ -786,13 +782,13 @@ func maybeDelete(cfg pluginConfig, result probeResult) probeResult {
 		}
 		return result
 	}
-	if !confirmHardFailure(result.Name, result.Reason, cfg.HardFailureConfirmations) {
-		result.Action = "keep"
-		result.Reason += ":pending_confirmation"
-		return result
-	}
 	if !boolVal(cfg.AutoDelete, true) || cfg.DryRun {
 		result.Action = "would_delete"
+		return result
+	}
+	if !confirmHardFailure(result.Name, result.Reason, updatedAt, cfg.HardFailureConfirmations) {
+		result.Action = "keep"
+		result.Reason += ":pending_new_failure"
 		return result
 	}
 	if strings.TrimSpace(cfg.ManagementKey) == "" {
@@ -823,22 +819,22 @@ func classifyRecordedStatus(status, message string) string {
 	}
 	lower := strings.ToLower(status + " " + message)
 	switch {
-	case strings.Contains(lower, "http 429"), strings.Contains(lower, "http_429"), strings.Contains(lower, "status=429"):
+	case strings.Contains(lower, "http 429"), strings.Contains(lower, "http_429"), strings.Contains(lower, "status=429"), strings.Contains(lower, "quota exhausted"):
 		return "rate_limited"
 	case strings.Contains(lower, "http 403"), strings.Contains(lower, "http_403"), strings.Contains(lower, "status=403"):
 		return "permission_denied"
-	case strings.Contains(lower, "http 402"), strings.Contains(lower, "http_402"), strings.Contains(lower, "status=402"):
+	case strings.Contains(lower, "http 402"), strings.Contains(lower, "http_402"), strings.Contains(lower, "status=402"), strings.Contains(lower, "payment_required"):
 		return "spending_limit"
-	case strings.Contains(lower, "http 401"), strings.Contains(lower, "http_401"), strings.Contains(lower, "status=401"):
+	case strings.Contains(lower, "http 401"), strings.Contains(lower, "http_401"), strings.Contains(lower, "status=401"), strings.Contains(lower, "unauthorized"):
 		return "auth_invalid"
 	default:
 		return ""
 	}
 }
 
-func confirmHardFailure(name, reason string, needed int) bool {
+func confirmHardFailure(name, reason string, updatedAt time.Time, needed int) bool {
 	name = strings.TrimSpace(name)
-	if name == "" {
+	if name == "" || updatedAt.IsZero() {
 		return false
 	}
 	if needed <= 1 {
@@ -847,11 +843,14 @@ func confirmHardFailure(name, reason string, needed int) bool {
 	hardFailureMu.Lock()
 	defer hardFailureMu.Unlock()
 	previous := hardFailures[name]
-	if previous.Reason == reason {
+	if previous.Reason == reason && updatedAt.After(previous.UpdatedAt) {
 		previous.Count++
+	} else if previous.Reason == reason {
+		return false
 	} else {
 		previous = hardFailureState{Reason: reason, Count: 1}
 	}
+	previous.UpdatedAt = updatedAt
 	hardFailures[name] = previous
 	return previous.Count >= needed
 }
@@ -886,14 +885,14 @@ func classifyText(text string) string {
 	switch {
 	case strings.Contains(lower, "permission-denied"), strings.Contains(lower, "access to the chat endpoint is denied"):
 		return "permission_denied"
-	case strings.Contains(lower, "spending-limit"), strings.Contains(lower, "run out of credits"), strings.Contains(lower, "personal-team-blocked"):
+	case strings.Contains(lower, "spending-limit"), strings.Contains(lower, "run out of credits"), strings.Contains(lower, "personal-team-blocked"), strings.Contains(lower, "payment_required"):
 		return "spending_limit"
-	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "rate_limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "resource_exhausted"), strings.Contains(lower, "free-usage-exhausted"), strings.Contains(lower, "usage-exhausted"), strings.Contains(lower, "usage resets over a rolling"):
+	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "rate_limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "resource_exhausted"), strings.Contains(lower, "free-usage-exhausted"), strings.Contains(lower, "usage-exhausted"), strings.Contains(lower, "usage resets over a rolling"), strings.Contains(lower, "quota exhausted"):
 		return "rate_limited"
 	case strings.Contains(lower, "upgrade required"), strings.Contains(lower, "cli version"):
 		// Version issue is config problem, not account death; keep account.
 		return ""
-	case strings.Contains(lower, "unauthenticated"), strings.Contains(lower, "invalid token"), strings.Contains(lower, "token expired"):
+	case strings.Contains(lower, "unauthenticated"), strings.Contains(lower, "unauthorized"), strings.Contains(lower, "invalid token"), strings.Contains(lower, "token expired"):
 		return "auth_invalid"
 	default:
 		return ""
@@ -1244,7 +1243,6 @@ func persistPluginConfig(cfg pluginConfig) string {
 		"idle_timeout_minutes":       cfg.IdleTimeoutMinutes,
 		"require_user_traffic":       boolVal(cfg.RequireUserTraffic, true),
 		"hard_failure_confirmations": cfg.HardFailureConfirmations,
-		"delete_status_codes":        cfg.DeleteStatus,
 		"providers":                  cfg.Providers,
 	})
 	endpoint := strings.TrimRight(cfg.ManagementBase, "/") + "/v0/management/plugins/" + pluginName + "/config"
@@ -1293,7 +1291,6 @@ func sanitizeConfig(cfg pluginConfig) map[string]any {
 		"probe_enabled":              boolVal(cfg.ProbeEnabled, false),
 		"auto_delete":                boolVal(cfg.AutoDelete, false),
 		"dry_run":                    cfg.DryRun,
-		"delete_status_codes":        cfg.DeleteStatus,
 		"providers":                  cfg.Providers,
 		"concurrency":                cfg.Concurrency,
 		"probe_delay_ms":             cfg.ProbeDelayMS,
@@ -1403,7 +1400,7 @@ h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em}.sub{color:var(--muted);m
 	out.WriteString(`<div class="field"><label>闲置多久暂停（分钟）</label><input type="number" name="idle_timeout_minutes" min="5" step="5" value="` + fmt.Sprintf("%d", cfg.IdleTimeoutMinutes) + `"></div>`)
 	out.WriteString(`<button class="btn btn-primary" type="submit">保存设置</button>`)
 	out.WriteString(`</div></form>`)
-	out.WriteString(`<p class="muted" style="margin:12px 0 0">安全策略：没有真实 xAI 用户流量则完全闲置；插件不请求 xAI，仅根据 CPA 真实请求写入的 status/status_message 清理明确失效账号。429/限流始终保留；401/402/403 类硬失败需连续 ` + fmt.Sprintf("%d", cfg.HardFailureConfirmations) + ` 次才可能删除。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
+	out.WriteString(`<p class="muted" style="margin:12px 0 0">安全策略：没有真实 xAI 用户流量则完全闲置；插件不请求 xAI，仅根据 CPA 真实请求写入的 status/status_message 清理明确失效账号。429/限流始终保留；401/402/403 类硬失败需 ` + fmt.Sprintf("%d", cfg.HardFailureConfirmations) + ` 个不同真实失败事件才可能删除。本轮删除：<strong>` + fmt.Sprintf("%d", deleted) + `</strong></p>`)
 	out.WriteString(`</section>`)
 
 	// last scan panel
